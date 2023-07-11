@@ -1,0 +1,11 @@
+[please]
+version = >=17.0.0
+
+[PluginDefinition]
+Name = docker
+
+[PluginConfig "DEFAULT_DOCKER_REPO"]
+DefaultValue = hub.docker.com
+
+[Plugin "shell"]
+Target = //plugins:shell
