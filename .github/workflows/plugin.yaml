@@ -1,4 +1,4 @@
-name: C & C++ rules
+name: Docker rules
 on:
   - push
   - pull_request
