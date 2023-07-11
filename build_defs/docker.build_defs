@@ -1,0 +1,175 @@
+subinclude("///shell//build_defs:shell")
+
+def docker_image(name:str, srcs:list=[], image:str=None, version:str='',
+                 dockerfile:str='Dockerfile', base_image:str='', repo:str='', labels:list=[],
+                 pass_env:list=[], run_args:str='', test_only:bool=False, visibility:list=None, build_args:str='',
+                 container_args:str=''):
+    """docker_image defines a build rule for a Docker image.
+
+    You must use `plz run` to actually build the target.
+    There are also several related targets created, for example a fully qualified name
+    (henceforth fqn) which is used by other rules to identify this one.
+
+    Args:
+      name: Name of the rule.
+      srcs: Source files that are available within the dockerfile.
+      image: Name of the image to create.
+      version: Version to tag the image with. If not given, a hash will be derived for the version.
+      dockerfile: The Dockerfile that defines how to build this image.
+      base_image: The build target that defines the base image. Only necessary if this image
+                  is based off another plz image.
+      repo: Repository to store this image in. If not given then you'll need to set
+            default-docker-repo in the [buildconfig] section of your .plzconfig.
+      labels: Labels to tag this rule with.
+      pass_env: Environment variables that might be needed to resolve the base image fqn
+      run_args: Any additional arguments to provide to 'docker run'.
+      test_only: If True, this can only be depended on by test rules.
+      visibility: Visibility of this rule.
+      build_args: Any arguments to provide to 'docker build'
+      container_args: Any arguments to provide to the container's entrypoint during 'docker run'
+    """
+    image = image or name
+    if base_image:
+        base_image = canonicalise(base_image)
+    if not repo:
+        repo = CONFIG.DOCKER.DEFAULT_DOCKER_REPO
+    labels += ['docker_image=' + image, 'docker']
+
+    # This tarball becomes the build context for Docker.
+    tarball, dockerfile = _docker_tarball_rule(
+        name = name,
+        srcs = srcs,
+        dockerfile = dockerfile,
+        base_image = base_image,
+        pass_env = pass_env,
+        test_only = test_only,
+    )
+
+    # The FQN defines a unique hash for the image.
+    if CONFIG.HOSTOS == 'linux':
+        version = version or f'$(echo $(hash {tarball}) | sha256sum - | cut -f1 -d" ")'
+    elif CONFIG.HOSTOS == 'darwin':
+        version = version or f'$(echo $(hash {tarball}) | shasum -a 256 - | cut -f1 -d" ")'
+    else:
+        version = version or 'no_idea_how_to_compute_version_on_this_host'
+    fqn = build_rule(
+        name = f'{name}_fqn',
+        srcs = [tarball],
+        cmd = f'echo -n "{repo}/{image}:{version}" >> $OUT',
+        outs = [f'{name}_fqn'],
+        deps = [f'{base_image}_fqn' if base_image else None],
+        labels = labels + ["docker-fqn"],
+        stamp = True,
+        visibility = visibility,
+        test_only = test_only,
+        pass_env = pass_env,
+    )
+
+    # docker build
+    cmd = f'docker build {build_args} -t `cat $SRCS_FQN` -f $(basename $SRCS_DOCKERFILE) - < $(out_location {tarball})'
+    if base_image:
+        cmd = f'./$(out_location {base_image}) && {cmd}'
+    docker_build = sh_cmd(
+        name = name,
+        cmd = cmd,
+        srcs = {
+            'fqn': [fqn],
+            'dockerfile': [dockerfile],
+        },
+        deps = [
+            base_image,
+            tarball,
+        ],
+        visibility = visibility,
+        test_only = test_only,
+        labels = labels + ['docker-build'],
+    )
+
+    # For compat reasons _load is an alias for the main build target.
+    filegroup(
+        name = name + '_load',
+        srcs = [docker_build],
+        binary = True,
+        test_only = test_only,
+    )
+
+    # docker run
+    sh_cmd(
+        name = name + '_run',
+        cmd = f'./$(out_location {docker_build}) && docker run -it {run_args} `cat $SRCS` {container_args}',
+        srcs = [fqn],
+        deps = [docker_build],
+        visibility = visibility,
+        test_only = test_only,
+        labels = labels + ["docker-run"],
+    )
+
+    # docker push
+    sh_cmd(
+        name = name + '_push',
+        cmd = f'./$(out_location {docker_build}) && docker push `cat $SRCS`',
+        srcs = [fqn],
+        deps = [docker_build],
+        visibility = visibility,
+        test_only = test_only,
+        labels = labels + ["docker-push"],
+    )
+
+    # The TAR rule defines an output file for _save so it can be retrivable later
+    tar = build_rule(
+        name = f'{name}_tar',
+        # srcs = [tarball],
+        cmd = f'echo -n "" >> $OUT',
+        outs = [f'{name}.tar'],
+        deps = [f'{base_image}_fqn' if base_image else None],
+        labels = labels + ["docker-tar"],
+        stamp = True,
+        visibility = visibility,
+        test_only = test_only,
+    )
+
+    # docker image save
+    sh_cmd(
+        name = name + '_save',
+        cmd = f'./$(out_location {docker_build}) && docker image save `cat $SRCS` -o $(out_location {tar})',
+        srcs = [fqn],
+        deps = [docker_build, tar],
+        visibility = visibility,
+        test_only = test_only,
+        labels = labels + ["docker-save"],
+    )
+    return docker_build
+
+
+def _docker_tarball_rule(name, srcs, dockerfile, base_image, pass_env, test_only):
+    """Defines the tarball rule containing all required data for generating the container.
+
+    The resulting tarball will contain the Dockerfile as well as any required artifacts.
+    This will then later on be fed into `docker build` as a docker context.
+    """
+    if base_image:
+        # Define rule to template the source image into the Dockerfile.
+        if dockerfile.startswith('//'):
+            _, _, label = dockerfile.partition(':')
+            out = 'Dockerfile-' + label
+        else:
+            out = dockerfile
+
+        dockerfile = build_rule(
+            name = name,
+            tag = 'dockerfile',
+            srcs = {
+                'dockerfile': [dockerfile],
+                'fqn': [base_image + '_fqn'],
+            },
+            outs = [out],
+            pass_env = pass_env,
+            cmd = f'FQN="`cat $SRCS_FQN`"; sed -e "s|{base_image}|$FQN|g" $SRCS_DOCKERFILE >> $OUTS',
+            test_only = test_only,
+        )
+
+    return tarball(
+        name = '_%s#docker_context' % name,
+        srcs = srcs + [dockerfile],
+        test_only = test_only,
+    ), dockerfile
